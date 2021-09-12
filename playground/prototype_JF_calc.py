@@ -38,8 +38,10 @@ import astropy.io.fits as pyfits
 import astropy.constants as c
 import astropy.units as u
 from scipy.interpolate import RectBivariateSpline
+import codex2rt
 plt.ion()
 
+use_C=True
 fits_created = True
 
 def read_and_shorten_pw(fname, maxtau=20, maxr=7.5e13, max_dlrho=0.2, max_dlr=0.1, max_dltau=0.2):
@@ -202,7 +204,7 @@ def compute_grid(delta_s, k_r):
     
     return S_C1, S_C2, expdy
 
-def compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw):
+def compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat):
     """
     Compute the radiative transfer matrices for J and H. There are 5 input
     matrices:
@@ -220,8 +222,6 @@ def compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw):
     #The following arrays can be empty, but we want to debug...
     nr = Jw.shape[1]
     central_nmu = Jw.shape[0]-Jw.shape[1]
-    Jmat = np.zeros((nr, nr))
-    Hmat = np.zeros((nr, nr))
     Iinner_C = np.zeros((central_nmu+nr, nr))
     
     #We have to do our first 3-dimensional loop here, considering inwards going rays
@@ -268,9 +268,6 @@ def compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw):
                 for k in range(i-central_nmu,nr):
                     Jmat[j,k] += exptau*Iinner_C[i,k]*Jw[i,j]
                     Hmat[j,k] += exptau*Iinner_C[i,k]*Hw[i,j]
-        
-    return Jmat, Hmat
-
                       
 if __name__=="__main__":
     fits_fname = 'OPM00_os4300_0212.fits'
@@ -280,7 +277,9 @@ if __name__=="__main__":
     
     #This is everything we need for geometry
     delta_s, Jw, Hw, mus = compute_geometry(pwtab['r'])
-    
+    #Require that key arrays are contiguous.
+    Jw = np.require(Jw, requirements=['C'])
+    Hw = np.require(Hw, requirements=['C'])
 
     #The next code turns this into a fits file which will read quicker
     if fits_created:
@@ -312,10 +311,12 @@ if __name__=="__main__":
             
     #waves[1500] is 1.7 microns and a good wavelength to try radiative transfer.
     #Now we find opacity k from rho and kappa.
-    w_ixs = np.arange(len(nus)) #[1500]#np.range(100) #np.range(len(nus))
+    w_ixs = np.arange(len(nus)) #[1500]#np.arange(500) #np.arange(len(nus)) #np.range(100) #np.range(len(nus))
     nr = len(pwtab['r'])
     Js = np.empty((len(w_ixs), nr))
     Hs = np.empty((len(w_ixs), nr))
+    Jmat = np.require(np.zeros( (nr,nr) ), requirements=['C'])
+    Hmat = np.require(np.zeros( (nr,nr) ), requirements=['C'])
     for ix, w_ix in enumerate(w_ixs): 
         start = time.time()
         absn_func = RectBivariateSpline(prl, th, absn[w_ix])
@@ -331,7 +332,16 @@ if __name__=="__main__":
     
         #We have everything we need! Lets compute J and H, in three steps.
         S_C1, S_C2, expdy = compute_grid(delta_s, k_r)
-        Jmat, Hmat = compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw)
+        Hmat[:]=0
+        Jmat[:]=0
+        #Make sure the array is contiguous.
+        S_C1 = np.require(S_C1, requirements=['C'])
+        S_C2 = np.require(S_C2, requirements=['C'])
+        expdy = np.require(expdy, requirements=['C'])
+        if use_C:
+            codex2rt.compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat)
+        else:
+            compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat)
         Js[ix] = np.dot(Jmat, source_fns)
         Hs[ix] = np.dot(Hmat, source_fns)
         #print("Total Time: ", time.time()-start)
@@ -341,7 +351,7 @@ if __name__=="__main__":
     #Compute the total flux
     Ft = np.zeros((nr))
     for i in range(nr):
-        Ft[i] = 4*np.pi*np.sum(Hs[:,i]*dnus)
+        Ft[i] = 4*np.pi*np.sum(Hs[:,i]*dnus[w_ixs])
     plt.clf()
     plt.plot(((Ft*u.W/u.m**2)*4*np.pi*(pwtab['r']*u.cm)**2).to(u.L_sun).value)
     plt.xlabel('Layer')
@@ -350,5 +360,7 @@ if __name__=="__main__":
     print( "Rough Teff: ", ((flux/c.sigma_sb)**(1/4)).si )
     #To Check against a reference calculation...
     #np.save('Jmat.npy', Jmat)
-    #np.save('Hmat.npy', Jmat)
+    #np.save('Hmat.npy', Hmat)
+    #Jmat_old =np.load('Jmat.npy')
+    #Hmat_old =np.load('Hmat.npy')
     
