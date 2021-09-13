@@ -2,7 +2,7 @@ from setuptools import Extension
 from setuptools import setup
 import numpy as np
 
-module = Extension("codex2rt", sources=["codex2rt.c"], extra_compile_args=["-Wall"], \
+module = Extension("codex2rt", sources=["codex2rt.c"], extra_compile_args=["-Wall -O3"], \
     include_dirs=[np.get_include()])
 
 setup(

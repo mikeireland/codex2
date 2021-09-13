@@ -4,8 +4,29 @@
 #include <Python.h>
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include "numpy/arrayobject.h"
+#include <math.h>
+
 
 /* Low level routines */
+void compute_grid(int nr, int central_nmu, double *delta_s, double *k_r,
+        double *S_C1, double *S_C2, double *expdy){
+    int sti=nr-1, i, j, jmin=0;
+    //double *y =  (double*)malloc((nr-1) * (nr + central_nmu-1) * sizeof(double));
+    //if (y==NULL) return; //This shouldn't happen...
+    double y;
+    
+    for (i=0;i<nr+central_nmu-1;i++){
+        jmin = i - central_nmu;
+        if (jmin < 0) jmin=0;
+        for (j=jmin;j<nr-1;j++){
+            y = delta_s[i*sti+j]*0.5*(k_r[j] + k_r[j+1]);
+            expdy[i*sti+j] = exp(-y);
+            S_C1[i*sti+j] = (y - 1 + expdy[i*sti+j])/y;
+            S_C2[i*sti+j] = (1 - (1 + y)*expdy[i*sti+j])/y;
+        }
+    }
+}
+
 void compute_rtransfer(int nr, int central_nmu, double *S_C1, double *S_C2, 
         double *expdy, double *Jw, double *Hw,
         double *Jmat,  double *Hmat){
@@ -79,6 +100,95 @@ void compute_rtransfer(int nr, int central_nmu, double *S_C1, double *S_C2,
 /* Python level routines */
 static PyObject* codex2rtError;
 
+static PyObject* codex2rt_compute_grid(PyObject* self, PyObject* args) {
+    PyObject *arg1=NULL, *arg2=NULL, *out1=NULL, *out2=NULL, *out3=NULL;
+    PyArrayObject *a_delta_s=NULL, *a_k_r=NULL, *a_S_C1=NULL, *a_S_C2=NULL, *a_expdy=NULL;
+    npy_intp nr, central_nmu;
+
+    /* First, parse objects */
+    if (!PyArg_ParseTuple(args, "OOO!O!O!", &arg1, &arg2,
+        &PyArray_Type, &out1, &PyArray_Type, &out2, &PyArray_Type, &out3)) return NULL;
+
+    /* Now convert to Numpy arrays. hopefully this is super-quick if
+    they are already arrays!*/
+    a_delta_s = (PyArrayObject *)PyArray_FROM_OTF(arg1, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (a_delta_s == NULL) return NULL;
+    a_k_r = (PyArrayObject *)PyArray_FROM_OTF(arg2, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (a_k_r == NULL) goto fail;
+#if NPY_API_VERSION >= 0x0000000c
+    a_S_C1 = (PyArrayObject *)PyArray_FROM_OTF(out1, NPY_DOUBLE, NPY_ARRAY_INOUT_ARRAY2);
+#else
+    a_S_C1 = (PyArrayObject *)PyArray_FROM_OTF(out1, NPY_DOUBLE, NPY_ARRAY_INOUT_ARRAY);
+#endif
+    if (a_S_C1 == NULL) goto fail;
+#if NPY_API_VERSION >= 0x0000000c
+    a_S_C2 = (PyArrayObject *)PyArray_FROM_OTF(out2, NPY_DOUBLE, NPY_ARRAY_INOUT_ARRAY2);
+#else
+    a_S_C2 = (PyArrayObject *)PyArray_FROM_OTF(out2, NPY_DOUBLE, NPY_ARRAY_INOUT_ARRAY);
+#endif
+    if (a_S_C2 == NULL) goto fail;
+#if NPY_API_VERSION >= 0x0000000c
+    a_expdy = (PyArrayObject *)PyArray_FROM_OTF(out3, NPY_DOUBLE, NPY_ARRAY_INOUT_ARRAY2);
+#else
+    a_expdy = (PyArrayObject *)PyArray_FROM_OTF(out3, NPY_DOUBLE, NPY_ARRAY_INOUT_ARRAY);
+#endif
+    if (a_expdy == NULL) goto fail;
+ 
+    /* Check number of dimensions for arrays */
+    if ( (PyArray_NDIM(a_S_C1) != 2) || (PyArray_NDIM(a_S_C2) != 2) ||
+         (PyArray_NDIM(a_expdy) != 2) || (PyArray_NDIM(a_k_r) != 1) ||
+         (PyArray_NDIM(a_delta_s) != 2) ){
+        PyErr_SetString(
+            codex2rtError, "k_r has 1 dimension, and all other arrays must have 2 dimensions");
+        goto fail;
+    }
+    
+    /* Find the dimensions and check them */
+    nr = PyArray_DIM(a_delta_s,1)+1;
+    central_nmu = PyArray_DIM(a_delta_s,0) - PyArray_DIM(a_delta_s,1);
+    if (PyArray_DIM(a_k_r,0) != nr){
+        PyErr_SetString(
+            codex2rtError, "delta_s must have (nr-1) second dimension and k_r must have nr length.");
+        goto fail;
+    }
+    if ( (PyArray_DIM(a_S_C1,1) != nr-1) || (PyArray_DIM(a_S_C1,0) != nr+central_nmu-1) ||
+         (PyArray_DIM(a_S_C2,1) != nr-1) || (PyArray_DIM(a_S_C2,0) != nr+central_nmu-1) ||
+         (PyArray_DIM(a_expdy,1) != nr-1) || (PyArray_DIM(a_S_C2,0) != nr+central_nmu-1) ){    
+        PyErr_SetString(
+            codex2rtError, "S_C1, S_C2 and expdy must have (nr + central_nmu - 1, nr-1) dimensions.");
+        goto fail;
+    }
+        //Now do the low level computation.
+    compute_grid(nr, central_nmu, (double *)PyArray_DATA(a_delta_s), (double *)PyArray_DATA(a_k_r),
+        (double *)PyArray_DATA(a_S_C1), (double *)PyArray_DATA(a_S_C2), (double *)PyArray_DATA(a_expdy));
+
+    Py_DECREF(a_delta_s);
+    Py_DECREF(a_k_r);
+#if NPY_API_VERSION >= 0x0000000c
+    PyArray_ResolveWritebackIfCopy(a_S_C1);
+    PyArray_ResolveWritebackIfCopy(a_S_C2);
+    PyArray_ResolveWritebackIfCopy(a_expdy);
+#endif
+    Py_XDECREF(a_S_C1);
+    Py_XDECREF(a_S_C2);
+    Py_XDECREF(a_expdy);
+    Py_INCREF(Py_None);
+    return Py_None;
+
+ fail:
+    Py_DECREF(a_delta_s);
+    Py_DECREF(a_k_r);
+#if NPY_API_VERSION >= 0x0000000c
+    PyArray_DiscardWritebackIfCopy(a_S_C1);
+    PyArray_DiscardWritebackIfCopy(a_S_C2);
+    PyArray_DiscardWritebackIfCopy(a_expdy);
+#endif
+    Py_XDECREF(a_S_C1);
+    Py_XDECREF(a_S_C2);
+    Py_XDECREF(a_expdy);
+    return NULL;
+}
+
 static PyObject* codex2rt_compute_rtransfer(PyObject* self, PyObject* args) {
     PyObject *arg1=NULL, *arg2=NULL, *arg3=NULL, *arg4=NULL, *arg5=NULL, *out1=NULL, *out2=NULL;
     PyArrayObject *a_S_C1=NULL, *a_S_C2=NULL, *a_expdy=NULL, *a_Jw=NULL, *a_Hw=NULL, *a_Jmat=NULL, *a_Hmat=NULL;
@@ -112,18 +222,6 @@ static PyObject* codex2rt_compute_rtransfer(PyObject* self, PyObject* args) {
     a_Hmat = (PyArrayObject *)PyArray_FROM_OTF(out2, NPY_DOUBLE, NPY_ARRAY_INOUT_ARRAY);
 #endif
     if (a_Hmat == NULL) goto fail;
-
-    /* code that makes use of arguments */
-    /* You will probably need at least
-       nd = PyArray_NDIM(<..>)    -- number of dimensions
-       dims = PyArray_DIMS(<..>)  -- npy_intp array of length nd
-                                     showing length in each dim.
-       dptr = (double *)PyArray_DATA(<..>) -- pointer to data.
-
-       If an error occurs goto fail.
-     */
-    /* Can also use:
-    void *PyArray_DATA(PyArrayObject *arr)*/
     
     /* Check number of dimensions for arrays */
     if ( (PyArray_NDIM(a_S_C1) != 2) || (PyArray_NDIM(a_S_C2) != 2) ||
@@ -186,12 +284,9 @@ static PyObject* codex2rt_compute_rtransfer(PyObject* self, PyObject* args) {
     return NULL;
 }
 
-
 static PyObject* codex2rt_multi_rtransfer(PyObject* self, PyObject* args) {
     Py_RETURN_NONE;
 }
-
-
 
 static PyMethodDef codex2rtMethods[] = {
     {
@@ -200,6 +295,13 @@ static PyMethodDef codex2rtMethods[] = {
         METH_VARARGS,
         "Compute radiative transfer for a single wavelength.\n\n"
         "Return an (nr x nr) radiative transfer matrix for J and H",
+    },
+    {
+        "compute_grid",
+        codex2rt_compute_grid,
+        METH_VARARGS,
+        "Compute the grid of short characteristics components for radiative transfer.\n\n"
+        "Return incremental specific intensities and exp(-delta tau)",
     },
     {
         "multi_rtransfer",

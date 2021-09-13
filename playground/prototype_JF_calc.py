@@ -38,10 +38,12 @@ import astropy.io.fits as pyfits
 import astropy.constants as c
 import astropy.units as u
 from scipy.interpolate import RectBivariateSpline
+from scipy.optimize import root
 import codex2rt
 plt.ion()
 
 use_C=True
+cubic_interp=False
 fits_created = True
 
 def read_and_shorten_pw(fname, maxtau=20, maxr=7.5e13, max_dlrho=0.2, max_dlr=0.1, max_dltau=0.2):
@@ -178,7 +180,7 @@ def compute_geometry(rs, central_nmu=5):
     delta_s = x[:-1,1:] - x[:-1,:-1]
     return delta_s, Jw, Hw, mus
     
-def compute_grid(delta_s, k_r):
+def compute_grid(delta_s, k_r, S_C1, S_C2, expdy):
     """
     For x single wavelength, compute the grid of \Delta I coefficients
     going in the positive and negative directions.
@@ -188,21 +190,17 @@ def compute_grid(delta_s, k_r):
     #called t, which is also confusing!
     #The following arrays can be empty, but we want to debug...
     central_nmu = delta_s.shape[0]-delta_s.shape[1]
-    y = np.zeros((delta_s.shape[0], delta_s.shape[1]))
-    S_C1 = np.zeros_like(y)
-    S_C2 = np.zeros_like(y)
+    y = np.zeros_like(delta_s) 
+    
     for i in range(y.shape[0]):
         for j in range(np.maximum(i-central_nmu,0),y.shape[1]):
             y[i,j] = delta_s[i,j]*0.5*(k_r[j] + k_r[j+1])
             
     #We need not take exp(0) but can here for simplicity
     used = y != 0
-    expdy = np.zeros_like(y)
     expdy[used] = np.exp(-y[used])
     S_C1[used] = (y[used] - 1 + expdy[used])/y[used]
     S_C2[used] = (1 - (1 + y[used])*expdy[used])/y[used]
-    
-    return S_C1, S_C2, expdy
 
 def compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat):
     """
@@ -268,12 +266,139 @@ def compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat):
                 for k in range(i-central_nmu,nr):
                     Jmat[j,k] += exptau*Iinner_C[i,k]*Jw[i,j]
                     Hmat[j,k] += exptau*Iinner_C[i,k]*Hw[i,j]
-                      
+
+def calc_J_F(theta, lrho, prl, th_grid, prl_grid,delta_s, Jw, Hw, absn, nus, dnus):
+    """
+    Caculate J and F as a function or R.
+    
+    Issues - this should *not* get both rho and prl from 
+    the Wood model.
+    
+    Parameters
+    ----------
+    theta : numpy array
+        5040/T
+    prl : TYPE
+        DESCRIPTION.
+    rho : TYPE
+        DESCRIPTION.
+    delta_s : TYPE
+        DESCRIPTION.
+    Jw : TYPE
+        DESCRIPTION.
+    Hw : TYPE
+        DESCRIPTION.
+    absn : TYPE
+        DESCRIPTION.
+    nus : TYPE
+        DESCRIPTION.
+    dnus : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    J and F as a function of R
+
+    """
+    nr = len(theta)
+    nnu = len(nus)
+    Js = np.empty((nnu, nr))
+    Hs = np.empty((nnu, nr))
+    Jkappa = np.zeros((nr))
+    Bkappa = np.zeros((nr))
+    Jmat = np.require(np.zeros( (nr,nr) ), requirements=['C'])
+    Hmat = np.require(np.zeros( (nr,nr) ), requirements=['C'])
+    
+    #Pre-compute constants.
+    planck_exp_const = 6.626e-34/1.38e-23/5040
+    planck_mult_const = 2*6.626e-34/3e8**2
+
+    #Pre-compute interpolation weights for linear interpolation.
+    prl_ix = np.interp(prl, prl_grid, np.arange(len(prl_grid,)))
+    th_ix = np.interp(theta, th_grid, np.arange(len(th_grid,)))
+    prl_ix = np.minimum(prl_ix, len(prl_grid)-1.001)
+    th_ix = np.minimum(th_ix, len(th_grid)-1.001)
+    prl_int = prl_ix.astype(int)
+    th_int = th_ix.astype(int)
+    prl_frac = prl_ix - prl_int
+    th_frac = th_ix - th_int
+    kappa_r = np.empty(nr)
+    xvect = np.array([1-prl_frac,prl_frac]).T
+    yvect = np.array([1-th_frac,th_frac]).T
+    
+    for w_ix in range(nnu):
+        #Compute opacity
+        ab = absn[w_ix]
+        A = np.array([[ab[prl_int,th_int],ab[prl_int,th_int+1]],[ab[prl_int+1,th_int],ab[prl_int+1,th_int+1]]])
+        kappa_r = np.sum(np.einsum('ij,jki->ik', xvect, A)*yvect, axis=1)
+        k_r = 10**(kappa_r + lrho)
+        
+        #Compute the initial source function fot these layers
+        source_fns = planck_mult_const * nus[w_ix]**3/(np.exp(planck_exp_const*theta*nus[w_ix])-1)
+        
+        #We have everything we need! Lets compute J and H, in three steps.
+        if use_C:
+            codex2rt.compute_grid(delta_s, k_r, S_C1, S_C2, expdy)
+        else:
+            compute_grid(delta_s, k_r, S_C1, S_C2, expdy)
+        #Re-zero the initial matrices. Could be done in the C code...
+        Hmat[:]=0
+        Jmat[:]=0
+        if use_C:
+            codex2rt.compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat)
+        else:
+            compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat)
+        Js[w_ix] = np.dot(Jmat, source_fns)
+        Hs[w_ix] = np.dot(Hmat, source_fns)
+        Jkappa += kappa_r*Js[w_ix]*dnus[w_ix]
+        #!!! To be changed with scattering.
+        Bkappa += kappa_r*source_fns*dnus[w_ix] 
+    #Compute the total flux
+    Ft = np.zeros((nr))
+    Jt = np.zeros((nr))
+    for i in range(nr):
+        Ft[i] = 4*np.pi*np.sum(Hs[:,i]*dnus)
+        Jt[i] = np.sum(Js[:,i]*dnus)
+    return Ft, Jkappa, Bkappa
+
+def req_solve(theta, Ltarg, rs_m, lrho, prl, th_grid, prl_grid,delta_s, Jw, Hw, absn, nus, dnus):  
+    """
+    Solve for Radiative Equilibrium. We want both L_const and J=B to be true
+    How to make this possible? Maybe it isn't, just like the intuition 
+    in the Scholz days.
+
+    Parameters
+    ----------
+    theta : TYPE
+        DESCRIPTION.
+    Ltarg : TYPE
+        DESCRIPTION.
+    rs_m : TYPE
+        DESCRIPTION.
+    Others: See calc_J_F
+    
+    
+    Returns
+    -------
+    TYPE
+        DESCRIPTION.
+
+    """
+    L_sun = 3.828e+26 #SI units
+    Ft, Jkappa, Bkappa = calc_J_F(theta, lrho, prl, th_grid, prl_grid,delta_s, Jw, Hw, absn, nus, dnus)
+    scaled_L_error = (Ft*4*np.pi*rs_m**2/L_sun) / Ltarg - 1
+    scaled_J_error = (Jkappa - Bkappa)/Bkappa
+    print("Surface scaled L and J errors: {:.2f} {:.2f}".format(scaled_L_error[-1], scaled_J_error[-1]))
+    scaled_L_error[-4:] = scaled_J_error[-4:] 
+    #return scaled_L_error*scaled_J_error**2 + scaled_J_error*scaled_L_error**2
+    return scaled_L_error
+
 if __name__=="__main__":
     fits_fname = 'OPM00_os4300_0212.fits'
     #Read in the dynamical model
     pwfile = '/Users/mireland/theory/IScommon/dustmmi/pw/PWCan.M12L3P10'
     pwtab = read_and_shorten_pw(pwfile)
+    Ltarg = 0.491E+04
     
     #This is everything we need for geometry
     delta_s, Jw, Hw, mus = compute_geometry(pwtab['r'])
@@ -312,52 +437,96 @@ if __name__=="__main__":
     #waves[1500] is 1.7 microns and a good wavelength to try radiative transfer.
     #Now we find opacity k from rho and kappa.
     w_ixs = np.arange(len(nus)) #[1500]#np.arange(500) #np.arange(len(nus)) #np.range(100) #np.range(len(nus))
-    nr = len(pwtab['r'])
-    Js = np.empty((len(w_ixs), nr))
-    Hs = np.empty((len(w_ixs), nr))
-    Jmat = np.require(np.zeros( (nr,nr) ), requirements=['C'])
-    Hmat = np.require(np.zeros( (nr,nr) ), requirements=['C'])
-    for ix, w_ix in enumerate(w_ixs): 
-        start = time.time()
-        absn_func = RectBivariateSpline(prl, th, absn[w_ix])
+    S_C1 = np.require(np.zeros_like(delta_s), requirements=['C'])
+    S_C2 = np.require(np.zeros_like(delta_s), requirements=['C'])
+    expdy =np.require(np.zeros_like(delta_s), requirements=['C'])
+    
+    if False:
+        nr = len(pwtab['prl'])
+        Js = np.empty((len(w_ixs), nr))
+        Hs = np.empty((len(w_ixs), nr))
+        Jmat = np.require(np.zeros( (nr,nr) ), requirements=['C'])
+        Hmat = np.require(np.zeros( (nr,nr) ), requirements=['C'])
         
-        #Now interpolate for our layers
-        kappa_r = absn_func(pwtab['prl'],pwtab['theta'],grid=False)
-        k_r = 10**(kappa_r + pwtab['lrho'])
-        
-        #Compute the initial source function fot these layers
+        #Pre-compute constants.
         planck_exp_const = 6.626e-34/1.38e-23/5040
         planck_mult_const = 2*6.626e-34/3e8**2
-        source_fns = planck_mult_const * nus[w_ix]**3/(np.exp(planck_exp_const*pwtab['theta']*nus[w_ix])-1)
     
-        #We have everything we need! Lets compute J and H, in three steps.
-        S_C1, S_C2, expdy = compute_grid(delta_s, k_r)
-        Hmat[:]=0
-        Jmat[:]=0
-        #Make sure the array is contiguous.
-        S_C1 = np.require(S_C1, requirements=['C'])
-        S_C2 = np.require(S_C2, requirements=['C'])
-        expdy = np.require(expdy, requirements=['C'])
-        if use_C:
-            codex2rt.compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat)
-        else:
-            compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat)
-        Js[ix] = np.dot(Jmat, source_fns)
-        Hs[ix] = np.dot(Hmat, source_fns)
-        #print("Total Time: ", time.time()-start)
-        if ((ix % 100)==0):
-            print(w_ix)
-
-    #Compute the total flux
-    Ft = np.zeros((nr))
-    for i in range(nr):
-        Ft[i] = 4*np.pi*np.sum(Hs[:,i]*dnus[w_ixs])
-    plt.clf()
+        #Pre-compute interpolation weights for linear interpolation.
+        prl_ix = np.interp(pwtab['prl'], prl, np.arange(len(prl)))
+        th_ix = np.interp(pwtab['theta'], th, np.arange(len(th)))
+        prl_int = prl_ix.astype(int)
+        th_int = th_ix.astype(int)
+        prl_frac = prl_ix - prl_int
+        th_frac = th_ix - th_int
+        kappa_r = np.empty(nr)
+        xvect = np.array([1-prl_frac,prl_frac]).T
+        yvect = np.array([1-th_frac,th_frac]).T
+        
+        start = time.time()
+        tinterp = 0
+        for ix, w_ix in enumerate(w_ixs): 
+            #Strangely, this is quite slow - mostly extracting from absn
+            #Interpolation: 133ms
+            #rtransfer: 222ms
+            #dot: 17ms
+            #compute_grid: 22ms
+            #Everything else: 80ms
+            #Going any further needs putting this full loop in C.
+            #t1 = time.time()
+            if cubic_interp:
+                absn_func = RectBivariateSpline(prl, th, absn[w_ix])
+                
+                #Now interpolate for our layers
+                kappa_r = absn_func(pwtab['prl'],pwtab['theta'],grid=False)
+            else:
+              ab = absn[w_ix]
+              A = np.array([[ab[prl_int,th_int],ab[prl_int,th_int+1]],[ab[prl_int+1,th_int],ab[prl_int+1,th_int+1]]])
+              kappa_r = np.sum(np.einsum('ij,jki->ik', xvect, A)*yvect, axis=1)
+            #t2=time.time()
+            #tinterp += t2-t1
+            
+            #pdb.set_trace()
+            #kappa_r = absn[w_ix][prl_int:prl_int+1, th_int:th_int+1] 
+            k_r = 10**(kappa_r + pwtab['lrho'])
+            
+            #Compute the initial source function fot these layers
+            source_fns = planck_mult_const * nus[w_ix]**3/(np.exp(planck_exp_const*pwtab['theta']*nus[w_ix])-1)
+            
+            #We have everything we need! Lets compute J and H, in three steps.
+            if use_C:
+                codex2rt.compute_grid(delta_s, k_r, S_C1, S_C2, expdy)
+            else:
+                compute_grid(delta_s, k_r, S_C1, S_C2, expdy)
+            #Re-zero the initial matrices. Could be done in the C code...
+            Hmat[:]=0
+            Jmat[:]=0
+            if use_C:
+                codex2rt.compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat)
+            else:
+                compute_rtransfer(S_C1, S_C2, expdy, Jw, Hw, Jmat, Hmat)
+            Js[ix] = np.dot(Jmat, source_fns)
+            Hs[ix] = np.dot(Hmat, source_fns)
+        print("Total Time (ms): {:.1f}".format((time.time()-start)*1e3))
+        print("Interpolation Time (ms): {:.1f}".format(tinterp*1e3))
+        
+        #Compute the total flux
+        Ft = np.zeros((nr))
+        for i in range(nr):
+            Ft[i] = 4*np.pi*np.sum(Hs[:,i]*dnus[w_ixs])
+            
+    theta = pwtab['theta']
+    Ft, Jkappa, Bkappa = calc_J_F(theta, pwtab['lrho'], pwtab['prl'], th, prl,delta_s, Jw, Hw, absn, nus, dnus)
+    #plt.clf()
     plt.plot(((Ft*u.W/u.m**2)*4*np.pi*(pwtab['r']*u.cm)**2).to(u.L_sun).value)
     plt.xlabel('Layer')
     plt.ylabel('Luminosity (L_sun)')
     flux = Ft[10]*u.W/u.m**2
     print( "Rough Teff: ", ((flux/c.sigma_sb)**(1/4)).si )
+    
+    #Now legs try to solve!(theta, Ltarg, rs_m, lrho, prl, th_grid, prl_grid,delta_s, Jw, Hw, absn, nus, dnus):
+    soln = root(req_solve, theta, args=(Ltarg, 0.01*pwtab['r'], pwtab['lrho'], pwtab['prl'], th, prl, delta_s, Jw, Hw, absn, nus, dnus))
+    
     #To Check against a reference calculation...
     #np.save('Jmat.npy', Jmat)
     #np.save('Hmat.npy', Hmat)
